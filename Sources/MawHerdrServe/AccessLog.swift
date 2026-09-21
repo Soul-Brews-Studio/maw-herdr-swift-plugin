@@ -26,14 +26,34 @@ func accessStamp(_ date: Date, timeZone: TimeZone = .current) -> String {
     + " \(sign)\(pad(absolute / 60))\(pad(absolute % 60))"
 }
 
-/// Path plus only the query keys that cannot carry a credential. Anything
-/// dropped is marked with "…" so the log admits it is incomplete.
-func safeTarget(path: String, query: [String: String]) -> String {
-  let kept = query.filter { safeQueryKeys.contains($0.key) }.sorted { $0.key < $1.key }
-  let dropped = query.keys.contains { !safeQueryKeys.contains($0) }
-  var components = URLComponents()
-  components.queryItems = kept.isEmpty ? nil : kept.map { URLQueryItem(name: $0.key, value: $0.value) }
-  let encoded = components.percentEncodedQuery ?? ""
+/// `URLSearchParams.toString()` — the application/x-www-form-urlencoded
+/// serializer: `*-._` and alphanumerics pass, space becomes `+`, every other
+/// UTF-8 byte is `%XX` in upper-case hex. `URLComponents.percentEncodedQuery`
+/// leaves `:` and `/` alone, which is how `target=nope:0` used to reach the log
+/// where Bun writes `target=nope%3A0`.
+func formURLEncode(_ text: String) -> String {
+  var out = ""
+  for byte in text.utf8 {
+    switch byte {
+    case 0x20: out += "+"
+    case UInt8(ascii: "*"), UInt8(ascii: "-"), UInt8(ascii: "."), UInt8(ascii: "_"),
+      UInt8(ascii: "0")...UInt8(ascii: "9"), UInt8(ascii: "A")...UInt8(ascii: "Z"),
+      UInt8(ascii: "a")...UInt8(ascii: "z"):
+      out.unicodeScalars.append(Unicode.Scalar(byte))
+    default:
+      out += String(format: "%%%02X", byte)
+    }
+  }
+  return out
+}
+
+/// Path plus only the query keys that cannot carry a credential, in arrival
+/// order with repeats kept, as `url.searchParams.entries()` yields them.
+/// Anything dropped is marked with "…" so the log admits it is incomplete.
+func safeTarget(path: String, query: [(name: String, value: String)]) -> String {
+  let kept = query.filter { safeQueryKeys.contains($0.name) }
+  let dropped = query.contains { !safeQueryKeys.contains($0.name) }
+  let encoded = kept.map { formURLEncode($0.name) + "=" + formURLEncode($0.value) }.joined(separator: "&")
   var result = path
   if !encoded.isEmpty { result += "?\(encoded)" }
   if dropped { result += encoded.isEmpty ? "?…" : "&…" }

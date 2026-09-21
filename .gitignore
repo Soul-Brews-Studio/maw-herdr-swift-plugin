@@ -1,0 +1,4 @@
+.build/
+.tmp/
+*.local
+.claude/INCUBATED_BY

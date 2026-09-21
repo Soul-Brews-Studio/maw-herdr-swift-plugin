@@ -29,8 +29,11 @@ struct Window: Codable, Equatable, Sendable {
     try container.encode(active, forKey: .active)
     if let cwd, !cwd.isEmpty { try container.encode(cwd, forKey: .cwd) }
     try container.encode(status, forKey: .status)
-    if let agent, !agent.trimmingCharacters(in: .whitespaces).isEmpty {
-      try container.encode(agent.trimmingCharacters(in: .whitespaces), forKey: .agent)
+    // JS `String.prototype.trim()` strips line terminators as well as spaces,
+    // so `.whitespaces` (which does not contain \n, \r, \t) is not the same
+    // predicate. `.whitespacesAndNewlines` is.
+    if let agent, !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      try container.encode(agent.trimmingCharacters(in: .whitespacesAndNewlines), forKey: .agent)
     }
   }
 }
@@ -76,24 +79,85 @@ enum BackendError: Error, Sendable {
   case unavailable(String)
   /// A target the dashboard named does not exist.
   case unknownTarget(String)
+  /// The pane exists but holds no agent, so `agent prompt` cannot be used on
+  /// it. Bun's `target_not_agent`; the HTTP layer answers 409.
+  case notAgent(String)
+}
+
+/// Bun's `HTTPError`, thrown from inside the backend by the config, team and
+/// state readers (`config_unavailable`, `teams_unavailable`, …). The HTTP layer
+/// answers with exactly this status and `{"error": code}`; the socket layer
+/// treats it as any other backend failure.
+struct HTTPStatusError: Error, Sendable {
+  let status: Int
+  let code: String
+}
+
+/// What `/api/wake` reports. Bun's `wake()` returns exactly these three
+/// strings: `ready` after `agent start` verified readiness, `already-awake`
+/// when the pane already held an agent, `launched` when a configured launch
+/// line was submitted and a foreground process was observed.
+enum WakeState: String, Sendable {
+  case ready = "ready"
+  case alreadyAwake = "already-awake"
+  case launched = "launched"
+}
+
+/// A live `herdr terminal session control` stream behind `/ws/pty`.
+protocol HerdrTerminal: AnyObject, Sendable {
+  func input(_ bytes: Data) throws
+  func resize(cols: Int, rows: Int) throws
+  func close()
+  /// Resolves when the herdr child has exited — Bun's `done` promise.
+  func waitDone() async
 }
 
 /// Implemented by `HerdrProcessBackend` in Backend.swift by shelling out to the
 /// `herdr` binary — no shell, stdout only, 10s timeout, 4 MiB output cap —
-/// exactly as `mod.runHerdr.ts` does.
+/// exactly as `mod.runHerdr.ts` does. The wake engine (`--wake-engine`) is fixed
+/// when the backend is built, as `createHerdrBackend(binary, wakeEngine)` does.
 protocol HerdrBackend: AnyObject, Sendable {
   /// The whole roster: `herdr session list --json`, then
   /// `herdr --session <name> api snapshot` for each running session.
   func roster() async throws -> Roster
+  /// `dashboardSessions`: the same read, but one acquisition shared by every
+  /// socket client asking at once, and observed by `observedFeed` — so an
+  /// older roster can never publish a status after a newer one.
+  func dashboardSessions() async throws -> [Session]
+  /// Status-projection feed (`mod.createObservedFeed.ts`), fed by
+  /// `dashboardSessions` and read by the socket's `feed-history` / `feed`.
+  var observedFeed: ObservedFeed { get }
+  /// `~/.claude/teams` inventory, the `teams` frame and `/api/teams` body.
+  func teamInventory() throws -> JSONValue
   /// Visible text of one pane: `pane read <id> --source visible --lines N --format text`.
   func capture(target: String, lines: Int) async throws -> String
-  /// Several panes at once, each with its own line count; missing targets are
-  /// simply absent from the result rather than an error.
+  /// Several panes at once, each with its own line count. Any key that is not
+  /// in the roster fails the WHOLE batch with `unknownTarget` — Bun checks
+  /// every key before it reads a single pane.
   func captureBatch(_ requests: [String: Int]) async throws -> [String: String]
-  /// Type into a pane: `pane send-text <id> <text>` then `pane send-keys <id> enter`.
+  /// Prompt an agent pane: `agent prompt <id> <text>`. Rejects blank text and
+  /// panes with no agent. This is what REST `/api/send` uses.
   func send(target: String, text: String) async throws
-  /// Wake a pane: `agent start <name> --kind <engine> --pane <id> --timeout 8000`.
-  func wake(target: String, engine: String) async throws
+  /// Type into any pane: `pane send-text <id> <text>`, followed by
+  /// `pane send-keys <id> enter` ONLY when `enter` is true. This is what the
+  /// socket `send` command uses, with `enter` = the client's `force` flag —
+  /// so the default types the text and leaves it unsubmitted.
+  func sendLiteral(target: String, text: String, enter: Bool) async throws
+  /// Wake a pane or a registered repository: an existing agent is left alone
+  /// (`alreadyAwake`); a configured launch line is submitted (`launched`);
+  /// otherwise `agent start <name> --kind <engine> --pane <id> --timeout 8000`
+  /// (`ready`). `task` materialises an `agents/<slug>` worktree first. Every
+  /// success re-verifies the pane, registers the fleet file and runs the
+  /// configured `hooks.postWake`.
+  func wake(target: String, task: String?) async throws -> WakeState
+  /// `--inbox` delivery: writes `ψ/inbox/<stamp>_<from>_<slug>.md` under the
+  /// receiver's repository and returns the path. Never types into the pane.
+  func inbox(target: String, text: String, serverRoot: String, from: String) async throws -> String
+  /// `herdr terminal session control <pane> --cols --rows`, streaming frames to
+  /// `output` until the client detaches. At most 16 at once.
+  func openTerminal(
+    target: String, cols: Int, rows: Int, output: @escaping @Sendable (Data) -> Void
+  ) async throws -> any HerdrTerminal
 }
 
 // MARK: - WebSocket (live streaming)
@@ -117,7 +181,9 @@ struct AccessEntry: Sendable {
   var ip: String
   var method: String
   var path: String        // pathname only, never the raw query
-  var query: [String: String]  // parsed query; the logger scrubs it
+  /// Every query pair in arrival order, repeats included — what
+  /// `url.searchParams.entries()` yields. The logger scrubs it.
+  var query: [(name: String, value: String)]
   var status: Int
   var bytes: Int?
   var milliseconds: Double
@@ -138,7 +204,9 @@ enum Protocol {
   static let selectedLines = 80
   static let previewLines = 15
   static let socketPollMilliseconds = 1000
-  static let ticketLifetimeSeconds = 60
+  /// `expires: now + 30_000` in mod.runBunServe.ts. Was 60 here — a real 2x
+  /// divergence in how long a minted ticket stays spendable.
+  static let ticketLifetimeSeconds = 30
   static let paneStatuses: Set<String> = ["idle", "working", "blocked", "done", "unknown"]
   static let wakeEngines: Set<String> = [
     "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp", "mastracode",
