@@ -214,6 +214,168 @@ bun utils/conformance.mjs --claims          # + the 80 s ticket-expiry probe
 bun utils/conformance.mjs --send-probe      # + types into one agentless pane
 ```
 
+## Menu-bar tray
+
+`maw-herdr-tray` is a second executable in this package: a macOS menu-bar view of
+a running `maw herdr serve`. No dock icon, no window, no app bundle — it calls
+`NSApplication.shared.setActivationPolicy(.accessory)`, so `swift run` from a
+terminal is the whole install.
+
+```bash
+swift build -c release
+./.build/release/maw-herdr-tray                                  # defaults to 127.0.0.1:3467
+
+MAW_HERDR_URL=http://127.0.0.1:3479 ./.build/release/maw-herdr-tray
+MAW_HERDR_POLL_SECONDS=5 ./.build/release/maw-herdr-tray
+MAW_HERDR_TOKEN_FILE=~/.maw-herdr-token ./.build/release/maw-herdr-tray
+MAW_HERDR_TRAY_DEBUG=1 ./.build/release/maw-herdr-tray           # menu open/patch/close trace on stderr
+```
+
+Ctrl-C in that terminal, the Quit item, and the terminal going away are the same
+clean exit: SIGINT, SIGTERM and SIGHUP all stop the poller, close the socket, and
+terminate a server the tray itself started. SIGHUP is in that set because it is
+what a closed window, a closed herdr pane or a supervising shell delivers to a
+tray launched with a plain `&`, and its default action killed the process
+outright — measured: `kill -HUP` on the previous build ended it with exit 129,
+skipping the child-server teardown; on this build the same signal exits 0 with
+the child gone and its port released. To outlive the shell that launched it, use
+`nohup ./.build/release/maw-herdr-tray &`. An agent harness that stops a
+background job SIGTERMs the job's whole process group (measured: exit 143 on a
+bare `sleep`), which the tray treats as Quit — that, not a crash, is why two
+trays backgrounded from one harness shell can vanish together.
+
+### What it shows
+
+The menu-bar title is the fleet in one line — `◐1 ✳16 ✓1`: working, idle, done,
+each glyph in its own colour, digits in a monospaced-digit font so the item does
+not jitter. Bare shells are counted but deliberately not shown in the title
+(measured: 14 of 32 panes), or they would drown the agents that matter.
+
+The menu underneath adds, in order: the server's identity line and uptime, when
+the last refresh landed, the full count row (`32 panes · 18 agents  ◐1 ✳16 ✓1 ·14`),
+a flat **WORKING NOW** section, then every session — single-pane sessions flat,
+multi-pane sessions as submenus, with the rest folded into "Other sessions (N)".
+Each pane line reads `<glyph> <agent> — <repo>`, where `<repo>` is resolved from
+the ghq layout (`…/github.com/<org>/<repo>/…`), so a worktree shows as
+`neo-oracle/maw-cli-neo-21sep-mon2026` rather than `wt/maw-cli-neo-21sep-mon2026`.
+
+Data comes from `GET /api/sessions` (the count authority) plus `GET /api/identity`,
+with the `/ws` dashboard socket as a pure optimisation: it pushes the same
+`sessions` array, and when it is live the HTTP poll backs off to a slow heartbeat.
+Losing the socket costs latency, never correctness. `/api/agents` is deliberately
+**not** used for counts — it collapses `done`/`blocked`/`unknown` into `"idle"`
+and returns one row per *pane*, agent or not (measured: `count: 31` against 18
+real agents).
+
+Clicking a pane copies its `/api/capture` target to the pasteboard —
+`ZGVmYXVsdA/d0Q:Q`. Note the **base-36** suffix: the server publishes
+`windows[].index` as a decimal (26) but keys `/api/capture` by the raw pane-id
+suffix (`Q`), so `…:26` is a 400 and `…:Q` is a 200.
+
+### Live while open
+
+The menu repaints while you read it. Measured on this host (macOS 26, Swift 6.3,
+`.tmp/menuprobe`): main-actor work is *not* deferred while a status-item menu is
+tracking — a `Task { @MainActor }` from a background thread,
+`DispatchQueue.main.async`, `MainActor.run` and an `AsyncStream` consumer all
+ran with the menu open; only a default-mode `Timer` waited for the close. So
+every snapshot reaches an open menu, and the tray patches the existing items in
+place — titles, tooltips, enabled states — whenever the menu's *shape* is
+unchanged. A shape change (a pane came or went, a section appeared) waits for
+the close, because `removeAllItems()` on a tracking menu dismisses it. Proven:
+a menu opened on snapshot `13:07:47` read `updated 13:07:48` in a screenshot
+taken two seconds later, with `MAW_HERDR_TRAY_DEBUG=1` reporting
+`menu open — patched in place (32 items, snapshot 13:07:48)`.
+
+### Token posture
+
+- The token is read **fresh from disk per request** and goes into one
+  `Authorization: Bearer …` header. It is never printed, logged, held in a
+  snapshot, or put in an error string — failures name the token file's *path*,
+  never its contents, and JSON decode errors report coding-key names only.
+- On a **loopback** URL with no `MAW_HERDR_TOKEN_FILE` set, the tray adopts
+  `~/.maw-herdr-token` if it is readable. This is gated on loopback on purpose:
+  an operator token belongs to the local node and must never follow
+  `MAW_HERDR_URL` to a remote host.
+- For `/ws` in token mode it mints a single-use ticket via
+  `POST /api/auth/ws-ticket` per connect attempt, never cached across reconnects.
+- A token-mode server answers **401 to every route**. The tray renders that as
+  `⚠ no token` with "Server is up but refused this client", not as "herdr down" —
+  up-and-refusing and down are different problems with different fixes.
+
+### Driving it from automation
+
+`System Events` addresses a process by *name*, and every instance of this tray
+is named `maw-herdr-tray`, so two trays (one per port) are indistinguishable by
+name. Pick the process by pid instead, and read the endpoint off the status
+button — it is in the button's `AXIdentifier` and its `AXDescription`, while
+the `AXTitle` stays the glyph counts (VoiceOver reads the description, which
+turns `◐1 ✳16 ✓1` into words):
+
+```applescript
+tell application "System Events" to tell (first process whose unix id is 34832)
+  get {title, description, help} of menu bar item 1 of menu bar 1
+  -- "◐1 ✳16 ✓1", "maw-herdr-tray 127.0.0.1:3467: 1 working, 16 idle, 1 done, 14 shells",
+  -- "maw-herdr-tray — http://127.0.0.1:3467"
+end tell
+```
+
+Two traps, both measured. An AX walk (`get title of every menu item of menu 1
+of menu bar item 1 …`) answers in full on a **closed** menu — it even fires the
+open/close delegate pair — so it proves nothing about what is on screen; the
+`MAW_HERDR_TRAY_DEBUG=1` trace is the app's own word. And with no app bundle the
+process has no TCC identity of its own: Accessibility and Screen Recording are
+attributed to the terminal that launched it, and a future `.app` bundle will
+prompt again.
+
+### What it deliberately cannot do
+
+**The tray is read-only toward the fleet.** The running tray issues
+`GET /api/identity`, `GET /api/sessions`, the `/ws` upgrade and
+`POST /api/auth/ws-ticket`, nothing else; the client type also knows
+`GET /api/agents` and `GET /api/capture`, but nothing in the target calls them
+(`rg` finds no caller) — a capture target is *copied*, never requested.
+`/api/send` and `/api/wake` are not referenced anywhere in the target and must
+stay that way — this runs against a live fleet of other people's agents, and a
+menu-bar app that can type into someone's pane is a weapon. The `/ws` socket
+never sends a text frame either; the only client frames it emits are keepalive
+pings.
+
+It also will not touch a server it did not launch:
+
+- **Start server** is disabled whenever anything is already answering on the
+  port — the tray never adds a second listener.
+- **Stop server** is disabled unless *this tray* started the process. A
+  `maw herdr serve` someone else is running is never signalled, not on Quit and
+  not on terminate.
+
+And it is not a terminal: there is no pane preview, no scrollback pane, and no
+way to focus a pane from the menu. The per-pane action is "copy the address",
+and what you do with it is your business.
+
+### Known limits
+
+- **Pane addresses are exact up to pane #1024 of a workspace.** herdr builds a
+  pane id as `<ws>:p` + a bijective, big-endian number over the 32-symbol
+  alphabet `123456789ABCDEFGHJKMNPQRSTVWXYZ0` (herdrdev/herdr
+  `src/workspace.rs:105-123`; installed herdr 0.9.1) — no lowercase, no I/L/O/U,
+  and `0` is the 32nd symbol, not a zero digit. The server publishes only the
+  base-36 *value* of that suffix and keys `/api/capture` by the raw suffix, so
+  the tray re-encodes; that round-trip is exact for every suffix without a
+  leading `0`, i.e. panes #1..#1024 (the 23 local panes measured today are
+  ≤ #34). Panes #1025..#1056 encode as `01`..`00` and decode to the same value
+  as `1`..`0`; only the raw suffix tells them apart and the wire does not carry
+  it. Unlabelled panes are still exact (the suffix is parsed out of the
+  `<ws>:p<suffix>` name); a labelled pane that far up gets the short form, and
+  when two panes of one session publish one index the tooltip says
+  `AMBIGUOUS` instead of copying a wrong address in silence. A lowercase suffix,
+  which the server would also accept, cannot come out of herdr at all.
+- The `/ws` `recent` frame's `target` is the decimal form (`<session>:<index>`),
+  i.e. the very string `/api/capture` rejects for index ≥ 10. The tray ignores
+  that frame; a client that trusts it will get 400s.
+- `/api/agents` stays diagnostic-only — see above; anyone "fixing" the counts
+  from it will count 31 agents where there are 18.
+
 ## Traps
 
 - **`--listen` only accepts a loopback host.** `127.0.0.1`, `::1`, or
