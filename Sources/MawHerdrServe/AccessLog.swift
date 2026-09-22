@@ -26,15 +26,58 @@ func accessStamp(_ date: Date, timeZone: TimeZone = .current) -> String {
     + " \(sign)\(pad(absolute / 60))\(pad(absolute % 60))"
 }
 
-/// Path plus only the query keys that cannot carry a credential. Anything
-/// dropped is marked with "…" so the log admits it is incomplete.
-func safeTarget(path: String, query: [String: String]) -> String {
-  let kept = query.filter { safeQueryKeys.contains($0.key) }.sorted { $0.key < $1.key }
-  let dropped = query.keys.contains { !safeQueryKeys.contains($0) }
-  var components = URLComponents()
-  components.queryItems = kept.isEmpty ? nil : kept.map { URLQueryItem(name: $0.key, value: $0.value) }
-  let encoded = components.percentEncodedQuery ?? ""
-  var result = path
+/// `URLSearchParams.toString()` — the application/x-www-form-urlencoded
+/// serializer: `*-._` and alphanumerics pass, space becomes `+`, every other
+/// UTF-8 byte is `%XX` in upper-case hex. `URLComponents.percentEncodedQuery`
+/// leaves `:` and `/` alone, which is how `target=nope:0` used to reach the log
+/// where Bun writes `target=nope%3A0`.
+func formURLEncode(_ text: String) -> String {
+  var out = ""
+  for byte in text.utf8 {
+    switch byte {
+    case 0x20: out += "+"
+    case UInt8(ascii: "*"), UInt8(ascii: "-"), UInt8(ascii: "."), UInt8(ascii: "_"),
+      UInt8(ascii: "0")...UInt8(ascii: "9"), UInt8(ascii: "A")...UInt8(ascii: "Z"),
+      UInt8(ascii: "a")...UInt8(ascii: "z"):
+      out.unicodeScalars.append(Unicode.Scalar(byte))
+    default:
+      out += String(format: "%%%02X", byte)
+    }
+  }
+  return out
+}
+
+/// Path plus only the query keys that cannot carry a credential, in arrival
+/// order with repeats kept, as `url.searchParams.entries()` yields them.
+/// Anything dropped is marked with "…" so the log admits it is incomplete.
+/// `new URL(request.url).pathname` — the WHATWG path percent-encode set: C0
+/// controls, space, `"`, `#`, `<`, `>`, `?`, `` ` ``, `{`, `}`, DEL and every
+/// non-ASCII byte. An existing escape is left alone (`%` is not in the set),
+/// so `/api/he%22alth` stays exactly that.
+///
+/// `formatAccess` wraps the target in double quotes, nginx-style, so a raw `"`
+/// in the request path forged fields inside the quoted request. Measured
+/// 2026-09-22 on 3497: `GET /api/x"y` is logged there as `"GET /api/x%22y"`.
+func percentEncodePath(_ path: String) -> String {
+  var out = ""
+  for byte in path.utf8 {
+    switch byte {
+    case 0x00...0x20, 0x7F...0xFF,
+      UInt8(ascii: "\""), UInt8(ascii: "#"), UInt8(ascii: "<"), UInt8(ascii: ">"),
+      UInt8(ascii: "?"), UInt8(ascii: "`"), UInt8(ascii: "{"), UInt8(ascii: "}"):
+      out += String(format: "%%%02X", byte)
+    default:
+      out.unicodeScalars.append(Unicode.Scalar(byte))
+    }
+  }
+  return out
+}
+
+func safeTarget(path: String, query: [(name: String, value: String)]) -> String {
+  let kept = query.filter { safeQueryKeys.contains($0.name) }
+  let dropped = query.contains { !safeQueryKeys.contains($0.name) }
+  let encoded = kept.map { formURLEncode($0.name) + "=" + formURLEncode($0.value) }.joined(separator: "&")
+  var result = percentEncodePath(path)
   if !encoded.isEmpty { result += "?\(encoded)" }
   if dropped { result += encoded.isEmpty ? "?…" : "&…" }
   return result

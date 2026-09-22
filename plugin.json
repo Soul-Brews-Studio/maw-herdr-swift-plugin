@@ -1,0 +1,17 @@
+{
+  "name": "herdr-swift",
+  "version": "0.1.0",
+  "tier": "extra",
+  "runtime": "bun-dev",
+  "target": "js",
+  "entry": "index.mjs",
+  "cli": {
+    "command": "herdr-swift",
+    "help": "maw herdr-swift <serve> [--token-file PATH|--insecure-no-token] [--listen 127.0.0.1:3467] — herdr serve, in Swift",
+    "interactive": true
+  },
+  "sdk": "^1.0.0",
+  "description": "maw herdr serve, reimplemented in native Swift — same protocol as maw-herdr-plugin's Bun/TypeScript server, no shared runtime",
+  "license": "MIT",
+  "schemaVersion": 1
+}
