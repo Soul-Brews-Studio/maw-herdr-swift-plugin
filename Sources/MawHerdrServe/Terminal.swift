@@ -134,8 +134,6 @@ final class HerdrTerminalProcess: HerdrTerminal, @unchecked Sendable {
     buffer = Data()
     startTimer?.cancel()
     startTimer = nil
-    let descriptor = stdinDescriptor
-    stdinDescriptor = -1
     let timer = DispatchSource.makeTimerSource(queue: HerdrTerminalProcess.timers)
     timer.schedule(deadline: .now() + .milliseconds(500))
     let pid = self.pid
@@ -143,7 +141,27 @@ final class HerdrTerminalProcess: HerdrTerminal, @unchecked Sendable {
     timer.resume()
     cleanupTimer = timer
     lock.unlock()
-    if descriptor >= 0 { writeQueue.async { Darwin.close(descriptor) } }
+    closeStdin()
+  }
+
+  /// The descriptor's whole lifetime belongs to `writeQueue`, which is serial:
+  /// it is read there and cleared there, so a `write` block can never observe
+  /// a number that a `close` block has already handed back to the kernel.
+  ///
+  /// The shape this replaces read the descriptor under the lock in `write`,
+  /// released the lock, and only then enqueued the `Darwin.write`. `close()`
+  /// could run entirely inside that window — clearing the field and
+  /// enqueueing `Darwin.close(27)` FIRST — so the write landed on a closed,
+  /// possibly already-recycled fd, which on this server is the next accepted
+  /// client socket. A keystroke frame written into an unrelated connection.
+  private func closeStdin() {
+    writeQueue.async { [self] in
+      lock.lock()
+      let descriptor = stdinDescriptor
+      stdinDescriptor = -1
+      lock.unlock()
+      if descriptor >= 0 { Darwin.close(descriptor) }
+    }
   }
 
   private func finish() {
@@ -155,12 +173,10 @@ final class HerdrTerminalProcess: HerdrTerminal, @unchecked Sendable {
     startTimer = nil
     cleanupTimer?.cancel()
     cleanupTimer = nil
-    let descriptor = stdinDescriptor
-    stdinDescriptor = -1
     let waiters = doneWaiters
     doneWaiters = []
     lock.unlock()
-    if descriptor >= 0 { writeQueue.async { Darwin.close(descriptor) } }
+    closeStdin()
     for waiter in waiters { waiter.resume() }
   }
 
@@ -191,9 +207,14 @@ final class HerdrTerminalProcess: HerdrTerminal, @unchecked Sendable {
       throw backendError("terminal input overflow")
     }
     inputBytes += bytes.count
-    let descriptor = stdinDescriptor
     lock.unlock()
     writeQueue.async { [weak self] in
+      guard let self else { return }
+      // Read the descriptor HERE, on the serial queue that also owns the
+      // close, not on the caller's thread before enqueueing.
+      self.lock.lock()
+      let descriptor = self.stdinDescriptor
+      self.lock.unlock()
       var offset = 0
       var failed = descriptor < 0
       while !failed && offset < bytes.count {
@@ -207,7 +228,6 @@ final class HerdrTerminalProcess: HerdrTerminal, @unchecked Sendable {
         }
         offset += count
       }
-      guard let self else { return }
       self.lock.lock()
       self.inputBytes -= bytes.count
       self.lock.unlock()

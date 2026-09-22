@@ -56,7 +56,15 @@ func deliverReceiverInbox(
   let identity = try await resolveWakeIdentity(cwd: cwd, window: window, op: op)
   let oracle = normalize(.string(identity.oracle))
   if oracle.isEmpty { throw inboxUnavailable() }
-  let config = try readMawConfig(cwd: serverRoot)
+  // `readMawConfig` throws `HTTPError(503, 'config_unavailable')` directly in
+  // the reference, so every call site there propagates that code. Here it
+  // throws `MawConfigUnavailable` and each site maps it; this one did not,
+  // so POST /api/send {inbox:true} answered `herdr_unavailable` where the
+  // reference answers `config_unavailable`.
+  let config: JSONObject
+  do { config = try readMawConfig(cwd: serverRoot) } catch is MawConfigUnavailable {
+    throw HTTPStatusError(status: 503, code: "config_unavailable")
+  }
   var basePath = try canonical(identity.basePath)
   if normalize(config["oracle"]) == oracle, let psiPath = config["psiPath"]?.string, !jsTrim(psiPath).isEmpty {
     var override = NodePath.resolve(serverRoot, jsTrim(psiPath))

@@ -50,11 +50,34 @@ func formURLEncode(_ text: String) -> String {
 /// Path plus only the query keys that cannot carry a credential, in arrival
 /// order with repeats kept, as `url.searchParams.entries()` yields them.
 /// Anything dropped is marked with "…" so the log admits it is incomplete.
+/// `new URL(request.url).pathname` — the WHATWG path percent-encode set: C0
+/// controls, space, `"`, `#`, `<`, `>`, `?`, `` ` ``, `{`, `}`, DEL and every
+/// non-ASCII byte. An existing escape is left alone (`%` is not in the set),
+/// so `/api/he%22alth` stays exactly that.
+///
+/// `formatAccess` wraps the target in double quotes, nginx-style, so a raw `"`
+/// in the request path forged fields inside the quoted request. Measured
+/// 2026-09-22 on 3497: `GET /api/x"y` is logged there as `"GET /api/x%22y"`.
+func percentEncodePath(_ path: String) -> String {
+  var out = ""
+  for byte in path.utf8 {
+    switch byte {
+    case 0x00...0x20, 0x7F...0xFF,
+      UInt8(ascii: "\""), UInt8(ascii: "#"), UInt8(ascii: "<"), UInt8(ascii: ">"),
+      UInt8(ascii: "?"), UInt8(ascii: "`"), UInt8(ascii: "{"), UInt8(ascii: "}"):
+      out += String(format: "%%%02X", byte)
+    default:
+      out.unicodeScalars.append(Unicode.Scalar(byte))
+    }
+  }
+  return out
+}
+
 func safeTarget(path: String, query: [(name: String, value: String)]) -> String {
   let kept = query.filter { safeQueryKeys.contains($0.name) }
   let dropped = query.contains { !safeQueryKeys.contains($0.name) }
   let encoded = kept.map { formURLEncode($0.name) + "=" + formURLEncode($0.value) }.joined(separator: "&")
-  var result = path
+  var result = percentEncodePath(path)
   if !encoded.isEmpty { result += "?\(encoded)" }
   if dropped { result += encoded.isEmpty ? "?…" : "&…" }
   return result

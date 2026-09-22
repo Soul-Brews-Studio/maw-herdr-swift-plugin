@@ -15,11 +15,29 @@ enum OriginDecision: Equatable {
 func decideOrigin(header: String?, allowed: [String]) -> OriginDecision {
   guard let origin = header else { return .none }
   let pattern = #"^https?://([^/?#\s,@]+)$"#
-  // Bun re-parses with new URL() to reject a syntactically invalid authority.
-  guard origin.range(of: pattern, options: .regularExpression) != nil,
-        let url = URL(string: origin), let host = url.host else { return .refused }
-  if builtinOrigins.contains(origin) || allowed.contains(origin) || isLoopbackHost(host) {
-    return .allowed(origin)
+  guard origin.range(of: pattern, options: .regularExpression) != nil else { return .refused }
+  // `loopbackHost(match[1])` — the RAW authority the regex captured, not
+  // `new URL(origin).host`. Foundation case-folds and normalises a parsed
+  // host, and the reference's predicate is deliberately case-sensitive on
+  // `localhost` and deliberately strict on the IPv4 literal. Measured
+  // 2026-09-22 against the Bun server on 3497: `http://LOCALHOST:5173` 403,
+  // `http://127.0.0.01:5173` 403, `http://[::ffff:127.0.0.1]:5173` 200 — the
+  // last is what a dashboard page on a dual-stack socket actually sends, and
+  // the pre-fix port answered 403 to it, which is a dead UI.
+  // The `^https?://` in the reference has no `i` flag, so the scheme is
+  // lower-case or the origin never matched at all.
+  let authority: String
+  if origin.hasPrefix("https://") {
+    authority = String(origin.dropFirst("https://".count))
+  } else if origin.hasPrefix("http://") {
+    authority = String(origin.dropFirst("http://".count))
+  } else {
+    return .refused
+  }
+  if builtinOrigins.contains(origin) || allowed.contains(origin) || loopbackHost(authority) {
+    // `try { new URL(origin); return origin; } catch { }`: an authority the
+    // URL parser refuses (`http://127.999.1.1:5173`) falls through to the 403.
+    if authorityParses(authority) { return .allowed(origin) }
   }
   return .refused
 }

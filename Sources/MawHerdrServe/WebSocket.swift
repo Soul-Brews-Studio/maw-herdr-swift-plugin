@@ -200,6 +200,30 @@ private func wsClosePayload(code: UInt16, reason: String) -> Data {
   return payload
 }
 
+/// The close codes uWebSockets accepts on an INBOUND client close frame and
+/// will echo back. Measured 2026-09-22 against the Bun reference: `1000`-`1003`,
+/// `1007`-`1011`, and `4000`-`4999`. Note the accepted application range is
+/// `4000`-`4999`, NOT the full `3000`-`4999` of RFC 6455 — uWS rejects
+/// `3000`-`3999` (3000 and 3999 both come back as an empty close frame, 4000
+/// and 4999 are echoed).
+private func wsAcceptedCloseCode(_ code: UInt16) -> Bool {
+  (1000...1003).contains(code) || (1007...1011).contains(code) || (4000...4999).contains(code)
+}
+
+/// The payload uWebSockets echoes for a received client close frame: the
+/// client's own bytes verbatim when the code is accepted AND the reason is
+/// valid UTF-8; otherwise an EMPTY payload. A payload shorter than the two-byte
+/// code, a reserved/unlisted code, or a non-UTF-8 reason all collapse to the
+/// empty close frame (measured: `close 1000 + invalid-UTF-8 reason` is answered
+/// with a bodiless close on the reference, even though the code is valid).
+private func wsEchoClosePayload(_ payload: [UInt8]) -> Data {
+  guard payload.count >= 2 else { return Data() }
+  let code = UInt16(payload[0]) << 8 | UInt16(payload[1])
+  guard wsAcceptedCloseCode(code) else { return Data() }
+  guard String(bytes: payload[2...], encoding: .utf8) != nil else { return Data() }
+  return Data(payload)
+}
+
 // MARK: - Server
 
 /// Owns every live socket. The HTTP layer decides who may upgrade and writes
@@ -308,9 +332,26 @@ private final class WSSocket: @unchecked Sendable {
 
   // MARK: Lifecycle
 
-  /// Send a close frame, then drop the connection. Safe to call from anywhere,
-  /// including the framing path and the timer queue.
+  /// A SESSION close: send a close frame carrying `code`+`reason`, then drop
+  /// the connection. This is the application deciding to end the socket
+  /// (`1003 text JSON required`, `1008 invalid command JSON`, `1011 …`,
+  /// `1013 slow client`, `1001 server shutting down`, the pty session's
+  /// `1008`/`1011`), and both servers answer these with a proper close frame.
+  /// Safe to call from anywhere, including the timer queue.
   func closeWith(_ code: UInt16, _ reason: String) {
+    sendCloseAndDrop(payload: wsClosePayload(code: code, reason: reason))
+  }
+
+  /// A CLIENT close frame. uWebSockets — the reference's socket layer — echoes
+  /// it: an accepted close code carried with a valid-UTF-8 reason comes back
+  /// verbatim (same code, same reason bytes); anything else is answered with an
+  /// EMPTY close frame. `payload` is already `wsEchoClosePayload(...)`.
+  func replyClose(echo payload: Data) {
+    sendCloseAndDrop(payload: payload)
+  }
+
+  /// Send one close frame with `payload`, then drop the connection.
+  private func sendCloseAndDrop(payload: Data) {
     lock.lock()
     if stopped {
       lock.unlock()
@@ -322,7 +363,7 @@ private final class WSSocket: @unchecked Sendable {
     lock.unlock()
     handler?.close()
 
-    let frame = wsFrame(opcode: WSOpcode.close, payload: wsClosePayload(code: code, reason: reason))
+    let frame = wsFrame(opcode: WSOpcode.close, payload: payload)
     connection.send(
       content: frame,
       completion: .contentProcessed { [weak self] _ in
@@ -338,13 +379,25 @@ private final class WSSocket: @unchecked Sendable {
     }
   }
 
-  /// Give up without a close frame — the peer is already gone.
+  /// A FRAMING/protocol violation — reserved bits set, an unknown opcode, an
+  /// invalid control frame, non-UTF-8 text, a bad fragmentation sequence, or an
+  /// over-cap message. uWebSockets answers every one of these by dropping the
+  /// TCP connection with NO close frame at all (measured 2026-09-22 against the
+  /// Bun reference on /ws: a bare FIN, never a 1002/1007/1009 close frame), so
+  /// this port does too. The exception is an unmasked client frame, which uWS
+  /// mis-parses and leaves OPEN rather than dropping — that one is refused
+  /// cleanly with `closeWith(1002, …)` instead, and the divergence is recorded
+  /// (matching it would mean deliberately mis-parsing and leaking the socket).
+  func protocolClose() { terminate() }
+
+  /// Give up without a close frame — the peer is already gone, or a framing
+  /// violation drops the connection uWS-style.
   ///
   /// When a close frame is already in flight this must NOT cancel: measured on
   /// 2026-09-22, `cancel()` racing an unflushed `send` loses the close frame, so
   /// a client that rejected a bad frame saw the socket die with no status code
-  /// at all instead of 1002/1003/1007/1009. `closeWith` owns the teardown in
-  /// that case, from its own send completion.
+  /// at all instead of 1003/1008/1011/1013. `sendCloseAndDrop` owns the
+  /// teardown in that case, from its own send completion.
   private func terminate() {
     let (alreadyClosing, handler) = lock.withLock {
       let closingNow = closing
@@ -426,10 +479,22 @@ private final class WSSocket: @unchecked Sendable {
 
   // MARK: Framing
 
+  /// A message being reassembled from continuation frames. uWebSockets — the
+  /// reference's socket layer — reassembles fragments and hands the session
+  /// the whole message; this port used to answer 1002 to every one of them.
+  /// Held as a `readLoop` local, not a field, because `readLoop` is the only
+  /// reader of the frame stream and a field would be one more thing the
+  /// `@unchecked Sendable` had to justify.
+  private struct WSFragment {
+    var opcode: UInt8
+    var bytes: [UInt8]
+  }
+
   private func readLoop(leftover: Data) async {
     var buffer = [UInt8](leftover)
+    var fragment: WSFragment?
     while true {
-      if await !consume(&buffer) { break }
+      if await !consume(&buffer, &fragment) { break }
       guard let chunk = await receiveChunk() else { break }
       buffer.append(contentsOf: chunk)
     }
@@ -438,7 +503,7 @@ private final class WSSocket: @unchecked Sendable {
 
   /// Pull every complete frame out of `buffer`. Returns false once the socket
   /// is finished — either the peer closed or we rejected something.
-  private func consume(_ buffer: inout [UInt8]) async -> Bool {
+  private func consume(_ buffer: inout [UInt8], _ fragment: inout WSFragment?) async -> Bool {
     while true {
       if isStopped { return false }
       guard buffer.count >= 2 else { return true }
@@ -446,13 +511,19 @@ private final class WSSocket: @unchecked Sendable {
       let first = buffer[0]
       let second = buffer[1]
       if first & 0x70 != 0 {
-        closeWith(1002, "reserved bits must be zero")
+        // Reserved bits set (perMessageDeflate is off on both servers).
+        protocolClose()
         return false
       }
       let fin = first & 0x80 != 0
       let opcode = first & 0x0F
       // Every frame from a client is masked. An unmasked one is either a
-      // confused client or a proxy rewriting traffic; both are protocol errors.
+      // confused client or a proxy rewriting traffic. uWebSockets mis-parses
+      // it (reads four payload bytes as a phantom mask key) and LEAVES THE
+      // SOCKET OPEN waiting for bytes that never come; this port cannot match
+      // that without deliberately mis-parsing and leaking the connection, so
+      // it refuses cleanly with 1002. The one framing case that does not reach
+      // parity — recorded in Contract.swift.
       guard second & 0x80 != 0 else {
         closeWith(1002, "client frames must be masked")
         return false
@@ -469,7 +540,7 @@ private final class WSSocket: @unchecked Sendable {
         // The high bit of a 64-bit length must be zero; anything with it set is
         // past every cap below anyway.
         if buffer[2] & 0x80 != 0 {
-          closeWith(1009, "frame too large")
+          protocolClose()
           return false
         }
         length = 0
@@ -479,13 +550,13 @@ private final class WSSocket: @unchecked Sendable {
 
       let isControl = opcode & 0x08 != 0
       if isControl && (!fin || length > 125) {
-        closeWith(1002, "invalid control frame")
+        protocolClose()
         return false
       }
       // Checked before the payload is waited for, so a lying length header can
       // never make us buffer it.
       if length > wsMaxFrameBytes || (!isControl && length > wsMaxMessageBytes) {
-        closeWith(1009, "message too large")
+        protocolClose()
         return false
       }
 
@@ -497,46 +568,63 @@ private final class WSSocket: @unchecked Sendable {
       buffer.removeFirst(offset + length)
 
       let handler = lock.withLock { self.handler }
+      /// Hand a complete message to the session. `wsMaxMessageBytes` has
+      /// already been enforced on the accumulated length by every caller.
+      func deliver(opcode: UInt8, payload: [UInt8]) -> Bool {
+        if opcode == WSOpcode.text {
+          guard let text = String(bytes: payload, encoding: .utf8) else {
+            protocolClose()
+            return false
+          }
+          handler?.message(text: text)
+        } else {
+          handler?.message(binary: Data(payload))
+        }
+        return true
+      }
       switch opcode {
       case WSOpcode.continuation:
-        // Nothing this protocol sends or expects needs fragmenting; a
-        // fragmented client message is rejected rather than reassembled.
-        closeWith(1002, "fragmented messages are not supported")
-        return false
-      case WSOpcode.text:
-        guard fin else {
-          closeWith(1002, "fragmented messages are not supported")
+        guard var current = fragment else {
+          protocolClose()
           return false
         }
-        guard let text = String(bytes: payload, encoding: .utf8) else {
-          closeWith(1007, "text frames must be valid UTF-8")
+        // The 64 KiB cap is on the whole message, not the frame, so the
+        // 65537-byte oversize case still closes with 1009 however it is split.
+        guard current.bytes.count + payload.count <= wsMaxMessageBytes else {
+          protocolClose()
           return false
         }
-        handler?.message(text: text)
-      case WSOpcode.binary:
-        guard fin else {
-          closeWith(1002, "fragmented messages are not supported")
+        current.bytes.append(contentsOf: payload)
+        if fin {
+          fragment = nil
+          if !deliver(opcode: current.opcode, payload: current.bytes) { return false }
+        } else {
+          fragment = current
+        }
+      case WSOpcode.text, WSOpcode.binary:
+        // A second opening frame while a message is still being assembled is
+        // a protocol error; only control frames may interleave.
+        guard fragment == nil else {
+          protocolClose()
           return false
         }
-        handler?.message(binary: Data(payload))
+        if fin {
+          if !deliver(opcode: opcode, payload: payload) { return false }
+        } else {
+          fragment = WSFragment(opcode: opcode, bytes: payload)
+        }
       case WSOpcode.close:
-        var code: UInt16 = 1000
-        if payload.count >= 2 {
-          let received = UInt16(payload[0]) << 8 | UInt16(payload[1])
-          if (1000...1003).contains(received) || (1007...1011).contains(received)
-            || (3000...4999).contains(received)
-          {
-            code = received
-          }
-        }
-        closeWith(code, "")
+        // uWebSockets echoes the client's close verbatim for an accepted code
+        // with a valid-UTF-8 reason, and answers everything else with an empty
+        // close frame. wsEchoClosePayload encodes exactly that predicate.
+        replyClose(echo: wsEchoClosePayload(payload))
         return false
       case WSOpcode.ping:
         await sendFrame(opcode: WSOpcode.pong, payload: Data(payload))
       case WSOpcode.pong:
         break
       default:
-        closeWith(1002, "unknown opcode")
+        protocolClose()
         return false
       }
     }

@@ -191,6 +191,60 @@ struct AccessEntry: Sendable {
   var note: String?
 }
 
+// MARK: - Named, intentional divergences from the reference
+//
+// Everything else in this port is parity-or-report. These two are decisions,
+// recorded here so the conformance harness can whitelist them and so nobody
+// "fixes" them back.
+//
+//  1. `/api/identity` reports `"runtime": "swift"` where the reference
+//     hardcodes `"runtime": "bun"`. The field exists to tell an operator what
+//     is actually answering the port; a Swift binary claiming to be Bun is the
+//     one lie the field cannot afford. Every other byte of that body, key
+//     order included, is identical. This is the ONLY deliberate body-level
+//     difference in the port.
+//
+//  2. `Connection: close` on every non-101 response, one request per
+//     connection; the reference keeps the connection alive and emits no
+//     Connection header. A graceful half-close was implemented and reverted —
+//     it made this server the active closer and exhausted TIME_WAIT (150/150
+//     curl failures). Measured 2026-09-22: 300 rapid requests, 0 client-
+//     visible failures. See the README parity table.
+//
+//  3. An UNMASKED WebSocket data frame. RFC 6455 requires the server to fail
+//     the connection, and this port answers `1002`. uWebSockets — the
+//     reference's socket layer — instead MIS-PARSES it (it reads four payload
+//     bytes as a phantom mask key) and LEAVES THE SOCKET OPEN, waiting for
+//     bytes that never arrive. Measured 2026-09-22 on /ws. Matching it would
+//     mean deliberately mis-parsing and letting a one-frame client pin a
+//     connection slot open, so this is the one framing case left divergent on
+//     purpose. Every OTHER framing behaviour is now byte-for-byte: a protocol
+//     error (bad opcode, invalid control frame, non-UTF-8 text, bad
+//     fragmentation, an over-cap message) drops the TCP connection with no
+//     close frame, and a client CLOSE is echoed verbatim for an accepted code
+//     (1000-1003, 1007-1011, 4000-4999) with a valid-UTF-8 reason and answered
+//     with an empty close frame otherwise — see WebSocket.swift.
+//
+// And one REPORTED BUG that is reproduced rather than fixed, because it is in
+// the reference too and parity is the contract:
+//
+//  * Under `--insecure-no-token`, an unauthenticated caller can mint a
+//    `/ws/pty` ticket and open a fully interactive terminal into any pane.
+//    `/api/auth/ws-ticket` is excluded from `isWrite`, so it is served
+//    token-free in demo mode; it accepts `path: "/ws/pty"`; and the pty
+//    session carries no read-only flag on either server
+//    (`mod.createPtySession.ts` takes no `readOnly`, and neither does
+//    `WSPtySession`) — unlike the dashboard session, which does gate
+//    `wake`/`send` on it. The startup banner both servers print —
+//    "writes (send, wake, cleanup) still require --token-file" — is therefore
+//    wrong about the pty path on BOTH. The banner text is left byte-identical
+//    to the reference's on purpose: correcting only this copy would make the
+//    two servers disagree about a hole they share. A fix belongs in both, and
+//    in one of two places: refuse `path: "/ws/pty"` in the ticket route when
+//    the caller is unauthenticated, or thread `readOnly` into the pty session
+//    and reject `attach` plus every binary input frame when it is set.
+//    Reported upstream against the Bun server, not patched here.
+
 // MARK: - Constants shared by both sides of the protocol
 
 enum Protocol {

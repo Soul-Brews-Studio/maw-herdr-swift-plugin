@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 /// Startup options, parsed to the same rules as the Bun server's
 /// `readServeConfig`. Where the two disagree, the Bun one is right — it has the
@@ -52,7 +53,15 @@ func parseConfig(_ arguments: [String]) throws -> ServeConfig {
   var index = 0
 
   func value(for flag: String, inline: String?) throws -> String {
-    if let inline, !inline.isEmpty { return inline }
+    // `inline.length ? inline.join('=') : args[++i]` then `if (!value) throw`:
+    // an `=` that is PRESENT but empty (`--listen=`) is an explicit empty
+    // value and an immediate error. It does not fall through to the next
+    // argv element, which is how `--listen= 127.0.0.1:3467` used to be
+    // accepted here and refused there.
+    if let inline {
+      guard !inline.isEmpty else { throw fail("serve: invalid \(flag)") }
+      return inline
+    }
     index += 1
     guard index < arguments.count, !arguments[index].isEmpty else {
       throw fail("serve: invalid \(flag)")
@@ -133,7 +142,7 @@ func parseConfig(_ arguments: [String]) throws -> ServeConfig {
     var host = String(text[text.startIndex..<lastColon])
     host = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
     let portText = String(text[text.index(after: lastColon)...])
-    guard let port = Int(portText), port >= 0, port <= 65535, isLoopbackHost(host) else {
+    guard let port = Int(portText), port >= 0, port <= 65535, loopbackHost(host) else {
       throw fail("serve: --listen must use a loopback IP or localhost and port")
     }
     config.hostname = host
@@ -144,7 +153,11 @@ func parseConfig(_ arguments: [String]) throws -> ServeConfig {
     guard config.insecure else {
       throw fail("serve: --demo-minutes only applies to --insecure-no-token")
     }
-    guard let minutes = Int(demoMinutes), (1...9999).contains(minutes) else {
+    // `/^[1-9][0-9]{0,3}$/`, not a numeric parse: `Int()` also accepts `+5`
+    // and `0030`, which the reference refuses.
+    guard demoMinutes.range(of: #"^[1-9][0-9]{0,3}$"#, options: .regularExpression) != nil,
+      let minutes = Int(demoMinutes)
+    else {
       throw fail("serve: --demo-minutes must be 1..9999")
     }
     config.demoMinutes = minutes
@@ -213,8 +226,56 @@ private func readTokenFile(_ path: String) throws -> String {
   return token
 }
 
-func isLoopbackHost(_ host: String) -> Bool {
-  let lowered = host.lowercased()
-  if lowered == "localhost" || lowered == "::1" || lowered == "[::1]" { return true }
-  return lowered.range(of: #"^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$"#, options: .regularExpression) != nil
+/// `net.isIP(host) === 4` — node's strict dotted quad: exactly four groups,
+/// each 0..255, no leading zeros, ASCII digits only. The loose
+/// `^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$` this replaces admitted `127.0.0.01` and
+/// `127.999.1.1`, both of which the reference refuses (measured 2026-09-22
+/// against the Bun server on 3497: 403 and 500 respectively).
+func isIPv4Literal(_ host: String) -> Bool {
+  let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+  guard parts.count == 4 else { return false }
+  for part in parts {
+    guard (1...3).contains(part.count), part.allSatisfy({ $0.isASCII && $0.isNumber }) else { return false }
+    if part.count > 1 && part.first == "0" { return false }
+    guard let value = Int(part), value <= 255 else { return false }
+  }
+  return true
+}
+
+/// Port of `mod.loopbackHost.ts`, used for BOTH the Host-header guard and the
+/// CORS origin allowlist — the reference passes the same raw authority to the
+/// same predicate in both places, so a second, looser copy is how the two
+/// drift apart.
+///
+/// Three deliberate sharp edges, all measured against the reference:
+///   * `host === 'localhost'` is case-SENSITIVE, so `LOCALHOST` is refused.
+///   * the IPv4 branch is `isIP(host) === 4 && host.startsWith('127.')`, so
+///     `127.0.0.01` is refused even though WHATWG would parse it as 127.0.0.1.
+///   * an IPv6 literal is normalised first, so `[::ffff:127.0.0.1]` — what a
+///     dashboard page on a dual-stack socket actually sends — is allowed.
+func loopbackHost(_ authority: String) -> Bool {
+  guard !authority.isEmpty else { return false }
+  var host = authority
+  // `/^(?:\[([^\]]+)\]|([^:]+))(?::([0-9]+))?$/`, anchored, so a match covers
+  // the whole authority; no match at all means the raw string is the host,
+  // which is how a bare `::1` reaches the IPv6 branch below.
+  if authority.range(of: #"^(?:\[([^\]]+)\]|([^:]+))(?::([0-9]+))?$"#, options: .regularExpression) != nil {
+    if authority.hasPrefix("[") {
+      if let close = authority.firstIndex(of: "]") {
+        host = String(authority[authority.index(after: authority.startIndex)..<close])
+      }
+    } else if let colon = authority.lastIndex(of: ":") {
+      host = String(authority[authority.startIndex..<colon])
+    }
+  }
+  if host == "localhost" { return true }
+  if isIPv4Literal(host) { return host.hasPrefix("127.") }
+  // `isIP(host) === 6`: node refuses a zone id, so `fe80::1%en0` is not an IP.
+  guard host.contains(":"), !host.contains("%"), let address = IPv6Address(host) else { return false }
+  let bytes = [UInt8](address.rawValue)
+  guard bytes.count == 16 else { return false }
+  if bytes[0..<15].allSatisfy({ $0 == 0 }) && bytes[15] == 1 { return true }
+  // `/^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/` — 0x7f is 127.
+  return bytes[0..<10].allSatisfy { $0 == 0 } && bytes[10] == 0xff && bytes[11] == 0xff
+    && bytes[12] == 127
 }

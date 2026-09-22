@@ -1,0 +1,1 @@
+{"id": "x", "result": {"snapshot": {"protocol": 22, "workspaces": [{"workspace_id": "wA", "label": "\u0e2b\u0e49\u0e2d\u0e07\u0e41\u0e25\u0e47\u0e1a"}], "panes": [{"pane_id": "wA:p1", "workspace_id": "wA", "agent_status": "idle", "focused": false, "cwd": "/tmp"}], "tabs": []}, "type": "t"}}

@@ -85,7 +85,15 @@ check "write gate precedes method"  POST   /api/sessions 401
 check "sessions is GET-only"        DELETE /api/sessions 405
 check "unknown route"           GET  /api/does-not-exist 404
 check "capture needs a target"  GET  /api/capture 400
-check "stub route"              GET  /api/config 501
+check "config"                  GET  /api/config 200
+check "costs"                   GET  /api/costs  200
+check "asks"                    GET  /api/asks   200
+# Worktree enumeration and the signed federation probes are implemented now;
+# in the insecure demo a GET is a read, so both answer 200 (federation sweeps
+# the peers and 200s even when none are reachable).
+check "worktrees"               GET  /api/worktrees          200
+check "federation status"       GET  /api/federation/status  200
+check "fed.json alias"          GET  /fed.json               200
 # A preflight with no Origin is 403 on both servers — the browser always sends
 # one, so the check has to as well.
 check "preflight"               OPTIONS /api/sessions 204 -H "Origin: $BASE" -H 'Access-Control-Request-Method: GET'

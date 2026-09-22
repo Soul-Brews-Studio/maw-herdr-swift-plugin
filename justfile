@@ -19,6 +19,13 @@ run: build
 smoke: build
     bash utils/smoke.sh
 
+# Boots both servers (Bun on 3497, this one on 3498) against the same live
+# herdr, fires the same request at both, diffs status + headers + parsed body,
+# and kills both on every exit path. Non-zero exit = a real mismatch.
+#   --no-ws       HTTP cases only
+#   --claims      + the 80s ticket-expiry probe
+#   --send-probe  + types a `#` marker into ONE agentless pane, then clears it
+
 # protocol parity against the Bun reference server, side by side
 conformance: build
     bun utils/conformance.mjs

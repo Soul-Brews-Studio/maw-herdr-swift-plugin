@@ -76,6 +76,12 @@ private struct HTTPRequestHead: Sendable {
   func queryAll(_ name: String) -> [String] { queryPairs.filter { $0.name == name }.map(\.value) }
 }
 
+/// Any byte below 0x20 (HTAB included: it only ever arrives here as the fold
+/// prefix, which is handled before this runs) or 0x7F.
+private func hasControlByte(_ text: String) -> Bool {
+  text.unicodeScalars.contains { ($0.value < 0x20 && $0.value != 0x09) || $0.value == 0x7F }
+}
+
 private func parseRequestHead(_ block: Data) -> HTTPRequestHead? {
   guard let text = String(data: block, encoding: .utf8) ?? String(data: block, encoding: .isoLatin1)
   else { return nil }
@@ -104,6 +110,14 @@ private func parseRequestHead(_ block: Data) -> HTTPRequestHead? {
     let name = String(line[line.startIndex..<colon]).lowercased()
     guard !name.isEmpty else { return nil }
     let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+    // A control byte anywhere in a header name or value is a malformed
+    // request: bare `400 Bad Request` + `Connection: close`, nothing else.
+    // Measured 2026-09-22 on 3497 with `Origin: http://…\x1b[31m` and with
+    // `X-Junk: a\x01b` — both 400 there, both served here before this check,
+    // which also put the raw escape into the operator's access log.
+    guard !hasControlByte(name), !hasControlByte(value) else { return nil }
+    // `name:` with trailing whitespace before the colon is rejected too.
+    if let tail = name.last, tail == " " || tail == "\t" { return nil }
     if let existing = headers[name] { headers[name] = existing + ", " + value } else { headers[name] = value }
     lastName = name
   }
@@ -126,9 +140,15 @@ private func parseRequestHead(_ block: Data) -> HTTPRequestHead? {
 
   var contentLength: Int?
   if let raw = headers["content-length"] {
-    // A repeated Content-Length arrives here joined by ", " and fails to parse,
-    // which is the outcome that matters: it is never silently half-honoured.
-    guard let value = Int(raw.trimmingCharacters(in: .whitespaces)), value >= 0 else { return nil }
+    // A repeated Content-Length arrives here joined by ", ". The reference
+    // accepts it when every copy agrees and processes the body — measured
+    // 2026-09-22 on 3497, `Content-Length: 2` twice answers 401 for
+    // /api/send, i.e. the request ran. Only DIFFERING values are malformed;
+    // those stay a 400, because that is the request-smuggling shape.
+    let tokens = raw.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+    guard let first = tokens.first, tokens.allSatisfy({ $0 == first }),
+      let value = Int(first), value >= 0
+    else { return nil }
     contentLength = value
   }
 
@@ -144,16 +164,37 @@ private func parseRequestHead(_ block: Data) -> HTTPRequestHead? {
 /// `new URL()` resolves dot segments before the handler ever sees a pathname,
 /// so `/api/../api/send` is `/api/send` on both servers, not an unknown route.
 private func removeDotSegments(_ path: String) -> String {
-  guard path.hasPrefix("/"), path.contains(".") else { return path }
+  guard path.hasPrefix("/"), path.contains(".") || path.lowercased().contains("%2e") else { return path }
   let segments = path.dropFirst().components(separatedBy: "/")
   var kept: [String] = []
   var trailing = false
+  // WHATWG "is a single/double-dot path segment": `%2e` and `%2E` count as a
+  // dot. Measured 2026-09-22 on 3497 — `/api/%2e%2e/api/health` is 200 there
+  // and `/api/%2e%2e/api/nope` is 404, so the reference really does collapse
+  // the encoded form before routing. Without this the two servers hand the
+  // same request line to different handlers.
+  func dots(_ segment: String) -> Int {
+    var count = 0
+    var rest = Substring(segment)
+    while !rest.isEmpty {
+      if rest.hasPrefix(".") {
+        rest = rest.dropFirst()
+      } else if rest.count >= 3 && rest.prefix(3).lowercased() == "%2e" {
+        rest = rest.dropFirst(3)
+      } else {
+        return 0
+      }
+      count += 1
+      if count > 2 { return 0 }
+    }
+    return count
+  }
   for (index, segment) in segments.enumerated() {
     let last = index == segments.count - 1
-    switch segment {
-    case ".":
+    switch dots(segment) {
+    case 1:
       trailing = last
-    case "..":
+    case 2:
       if !kept.isEmpty { kept.removeLast() }
       trailing = last
     default:
@@ -193,34 +234,47 @@ private func formDecode(_ value: String) -> String {
 
 // MARK: - Loopback authority
 
-/// `mod.loopbackHost.ts`: authority with optional port, bare or bracketed IPv6,
-/// including the IPv4-mapped form a dual-stack client arrives as.
-private func loopbackAuthority(_ authority: String) -> Bool {
-  if authority.isEmpty { return false }
-  var host = authority
-  let pattern = #"^(?:\[([^\]]+)\]|([^:]+))(?::([0-9]+))?$"#
-  if let match = authority.range(of: pattern, options: .regularExpression) {
-    let text = String(authority[match])
-    if text.hasPrefix("[") {
-      if let close = text.firstIndex(of: "]") { host = String(text[text.index(after: text.startIndex)..<close]) }
-    } else if let colon = text.lastIndex(of: ":") {
-      host = String(text[text.startIndex..<colon])
-    } else {
-      host = text
-    }
+/// `parse an IPv4 number`, WHATWG URL §host parsing: `0x`/`0X` is hex, a bare
+/// leading `0` is octal, everything else decimal. An empty string after the
+/// prefix is 0.
+private func whatwgIPv4Number(_ input: String) -> UInt64? {
+  var text = input
+  var radix = 10
+  if text.count >= 2 && (text.hasPrefix("0x") || text.hasPrefix("0X")) {
+    text = String(text.dropFirst(2))
+    radix = 16
+  } else if text.count >= 2 && text.hasPrefix("0") {
+    text = String(text.dropFirst())
+    radix = 8
   }
-  // `host === 'localhost'` in the reference — case-sensitive, so `Host:
-  // LOCALHOST` is refused there and is refused here. IP literals are not
-  // affected: digits and hex have no case to differ in.
-  if host.lowercased() == "localhost" { return host == "localhost" }
-  if isLoopbackHost(host) { return true }
-  guard host.contains(":"), let address = IPv6Address(host) else { return false }
-  let bytes = [UInt8](address.rawValue)
-  guard bytes.count == 16 else { return false }
-  if bytes[0..<15].allSatisfy({ $0 == 0 }) && bytes[15] == 1 { return true }
-  // ::ffff:127.x.y.z — the same host, arriving over a dual-stack socket.
-  return bytes[0..<10].allSatisfy { $0 == 0 } && bytes[10] == 0xff && bytes[11] == 0xff
-    && bytes[12] == 127
+  if text.isEmpty { return 0 }
+  guard text.count <= 16 else { return nil }
+  return UInt64(text, radix: radix)
+}
+
+/// WHATWG: a host whose last label is a number is an IPv4 address, and an
+/// IPv4 address that does not parse is a URL parse FAILURE, not a domain.
+/// This is the rule that makes `new URL('http://127.999.1.1:3457/…')` throw —
+/// and Bun builds that URL from the Host header before its handler runs, so
+/// the reference answers `500 request_failed`. Measured 2026-09-22 on 3497.
+private func whatwgIPv4Host(_ host: String) -> Bool? {
+  var parts = host.components(separatedBy: ".")
+  if parts.count > 1 && parts.last == "" { parts.removeLast() }
+  guard let last = parts.last, !last.isEmpty else { return nil }
+  let endsInNumber =
+    last.allSatisfy { $0.isASCII && $0.isNumber }
+    || (last.count >= 2 && (last.hasPrefix("0x") || last.hasPrefix("0X"))
+      && last.dropFirst(2).allSatisfy { $0.isASCII && $0.isHexDigit })
+  guard endsInNumber else { return nil }
+  guard parts.count <= 4 else { return false }
+  var numbers: [UInt64] = []
+  for part in parts {
+    guard let number = whatwgIPv4Number(part) else { return false }
+    numbers.append(number)
+  }
+  for number in numbers.dropLast() where number > 255 { return false }
+  guard let tail = numbers.last else { return false }
+  return tail < (UInt64(1) << (8 * (5 - UInt64(numbers.count))))
 }
 
 /// Bun builds `new URL(request.url)` from the Host header before it looks at
@@ -228,7 +282,7 @@ private func loopbackAuthority(_ authority: String) -> Bool {
 /// server answers 500 `request_failed` — measured with `Host: ::1`, `Host: a b`
 /// and `Host: 12%.0.0.1`. It is reproduced rather than "fixed" because the
 /// alternative is serving a request the reference server refuses.
-private func authorityParses(_ authority: String) -> Bool {
+func authorityParses(_ authority: String) -> Bool {
   guard !authority.isEmpty else { return false }
   var rest = authority
   if let at = rest.lastIndex(of: "@") { rest = String(rest[rest.index(after: at)...]) }
@@ -267,6 +321,10 @@ private func authorityParses(_ authority: String) -> Bool {
       index += 1
     }
   }
+  // An IPv4-shaped host must BE a valid IPv4 address or the whole URL fails
+  // to parse. Without this, `Host: 127.999.1.1:3457` reached the loopback
+  // check and was served; the reference answers 500 request_failed.
+  if let ipv4 = whatwgIPv4Host(host) { return ipv4 }
   return true
 }
 
@@ -396,6 +454,9 @@ final class HerdrHTTPServer: @unchecked Sendable {
   private let access: AccessLog
   private let deliveryHistory = DeliveryFeed()
   private let delivery = DeliveryDedup()
+  /// `backend.federation` on the reference; owned here because the backend
+  /// contract in Contract.swift is fixed and the probes never touch herdr.
+  private let federation = FederationStatus()
   private let started = Date()
   private let listenQueue = DispatchQueue(label: "maw.herdr.http.listen")
   private let lock = NSLock()
@@ -509,12 +570,17 @@ final class HerdrHTTPServer: @unchecked Sendable {
 
   // MARK: Counters and tickets
 
+  /// `if (aborted || requests >= 64) return failure(503); requests++;` — the
+  /// check comes FIRST and a refused request never increments, so its caller
+  /// must not decrement either. The earlier shape incremented before the
+  /// `stopped` test and the caller's unconditional `defer` then ran anyway,
+  /// driving `inFlight` negative once per request taken after `stop()`.
   private func enterRequest() -> Bool {
     lock.lock()
     defer { lock.unlock() }
-    if stopped { return false }
+    if stopped || inFlight >= Protocol.maxInFlightRequests { return false }
     inFlight += 1
-    return inFlight <= Protocol.maxInFlightRequests
+    return true
   }
 
   private func leaveRequest() {
@@ -542,12 +608,20 @@ final class HerdrHTTPServer: @unchecked Sendable {
     return value
   }
 
-  /// Single use: the ticket is removed as it is read, with nothing awaited in
-  /// between, so two sockets can never spend the same one.
-  private func claimTicket(_ value: String) -> Ticket? {
+  /// Single use, but only on a ticket that actually passes: the reference does
+  /// `tickets.get(...)`, checks origin / path / expiry, and calls
+  /// `tickets.delete(...)` LAST — "single-use, before upgrade, with no
+  /// intervening await". Consuming before validating (what this did) let any
+  /// handshake that presented a real ticket on the wrong path or from the
+  /// wrong origin destroy it, so the legitimate holder's next upgrade failed.
+  /// Validation and removal share one lock acquisition, so the single-use
+  /// guarantee is unchanged.
+  private func claimTicket(_ value: String, origin: String, path: String) -> Ticket? {
     lock.lock()
     defer { lock.unlock() }
-    guard let ticket = tickets[value] else { return nil }
+    guard let ticket = tickets[value], ticket.origin == origin, ticket.path == path,
+      ticket.expires > Date()
+    else { return nil }
     tickets.removeValue(forKey: value)
     return ticket
   }
@@ -566,9 +640,8 @@ final class HerdrHTTPServer: @unchecked Sendable {
       .response(status: status, body: jsonBody(payload), note: nil)
     }
 
-    let admitted = enterRequest()
+    guard enterRequest() else { return (failure(503, "server_busy"), headers) }
     defer { leaveRequest() }
-    if !admitted { return (failure(503, "server_busy"), headers) }
 
     let hostHeader = head.headers["host"] ?? ""
     guard authorityParses(hostHeader) else {
@@ -578,7 +651,7 @@ final class HerdrHTTPServer: @unchecked Sendable {
       bare.set("Cache-Control", "no-store")
       return (.response(status: 500, body: jsonBody(errorBody("request_failed")), note: "request_failed"), bare)
     }
-    guard loopbackAuthority(hostHeader) else {
+    guard loopbackHost(hostHeader) else {
       return (failure(403, "host_not_allowed"), headers)
     }
 
@@ -613,9 +686,14 @@ final class HerdrHTTPServer: @unchecked Sendable {
       if let privateNetwork, privateNetwork != "true" {
         return (failure(403, "preflight_not_allowed"), headers)
       }
-      if privateNetwork != nil { headers.set("Access-Control-Allow-Private-Network", "true") }
+      // Allow-Methods and Allow-Headers are set BEFORE Allow-Private-Network,
+      // because HeaderBag preserves insertion order and the reference emits
+      // them in that order on the wire. Measured 2026-09-22 on 3497:
+      //   Access-Control-Allow-Methods / -Headers / -Private-Network / Date /
+      //   Content-Length: 0
       headers.set("Access-Control-Allow-Methods", "GET, POST")
       headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+      if privateNetwork != nil { headers.set("Access-Control-Allow-Private-Network", "true") }
       return (.response(status: 204, body: nil, note: nil), headers)
     }
 
@@ -646,8 +724,7 @@ final class HerdrHTTPServer: @unchecked Sendable {
         }
         let shape = #"^mwt1_[0-9a-f]{64}$"#
         guard offers[1].range(of: shape, options: .regularExpression) != nil,
-          let ticket = claimTicket(offers[1]), ticket.origin == origin, ticket.path == head.path,
-          ticket.expires > Date()
+          let ticket = claimTicket(offers[1], origin: origin, path: head.path)
         else { return (failure(401, "websocket_ticket_invalid"), headers) }
         readOnly = ticket.readOnly
       }
@@ -706,9 +783,15 @@ final class HerdrHTTPServer: @unchecked Sendable {
         else { return (failure(429, "too_many_tickets"), headers) }
         return (value(jsonObject([("protocol", .string(Protocol.webSocket)), ("ticket", .string(ticket))])), headers)
       } catch let error as HTTPFailure {
-        return (failure(error.status, error.message), headers)
+        // NOT `failure()`: the reference has no try/catch in this branch, so a
+        // throw from `readJSON` unwinds to the OUTER catch, which builds the
+        // body with `json(...)` and no note. An access line that carries
+        // `application_json_required` here is one the reference does not
+        // write. Found by the chunked-bad-json conformance case, which is a
+        // 415 out of `readJSON`.
+        return (.response(status: error.status, body: jsonBody(error.body ?? errorBody(error.message)), note: nil), headers)
       } catch {
-        return (failure(400, "invalid_json"), headers)
+        return (.response(status: 400, body: jsonBody(errorBody("invalid_json")), note: nil), headers)
       }
     }
 
@@ -836,11 +919,52 @@ final class HerdrHTTPServer: @unchecked Sendable {
       _ = try await backend.roster()
       return jsonObject([("ok", .bool(true))])
 
-    // Present on the Bun server, not ported: they depend on modules outside
-    // this port (federation probes, worktree cleanup, state files, costs).
-    case "/api/costs", "/api/config", "/api/asks", "/api/ui-state", "/api/worktrees", "/api/worktrees/cleanup",
-      "/api/federation/status", "/fed.json":
-      throw HTTPFailure(501, "not_implemented")
+    // A constant on the Bun side too: cost accounting is not a herdr surface,
+    // and the dashboard reads `supported:false` to hide the panel.
+    case "/api/costs":
+      return jsonObject([
+        ("agents", .array([])),
+        (
+          "total",
+          jsonObject([
+            ("tokens", .int(0)), ("cost", .int(0)), ("sessions", .int(0)), ("agents", .int(0)),
+          ])
+        ),
+        ("supported", .bool(false)),
+      ])
+
+    case "/api/config":
+      // `request.url.includes('?')` — a bare trailing "?" counts as a query.
+      if head.hasQuery { throw HTTPFailure(400, "config_query_not_supported") }
+      let peers = try config.namedPeers ?? federationNamedPeers()
+      return jsonObject([
+        ("node", .string(config.node)),
+        ("agents", jsonObject(config.agents.map { ($0.name, JSONValue.string($0.entry)) })),
+        (
+          "namedPeers",
+          .array(peers.map { jsonObject([("name", .string($0.name)), ("url", .string($0.url))]) })
+        ),
+      ])
+
+    case "/api/asks", "/api/ui-state":
+      let asks = head.path == "/api/asks"
+      if head.method == "POST" {
+        return try writeStateFile(
+          directory: config.dataDir, asks: asks, value: readJSON(head: head, body: body, limit: 256 << 10))
+      }
+      return try readStateFile(directory: config.dataDir, asks: asks)
+
+    case "/api/worktrees", "/api/worktrees/cleanup":
+      // Worktrees.swift. The body read is deferred into the handler so its
+      // 415/400 land inside the reference's catch-all (a cleanup with the
+      // wrong Content-Type is 400 worktree_cleanup_rejected, not 415).
+      return try await serveWorktrees(
+        cleanup: head.path == "/api/worktrees/cleanup", startupRoot: config.worktreeRoot,
+        readBody: { try self.readJSON(head: head, body: body, limit: 8192) },
+        sessions: { try await self.backend.roster().sessions }, op: HerdrOp())
+
+    case "/api/federation/status", "/fed.json":
+      return try await federation.status()
 
     default:
       throw HTTPFailure(404, "not_found")
@@ -1097,6 +1221,7 @@ private final class HTTPConnection: @unchecked Sendable {
   private var buffer = Data()
   private var head: HTTPRequestHead?
   private var overflow = false
+  private var chunked = false
   private var expected = 0
   private var startedAt = DispatchTime.now()
   private var dispatched = false
@@ -1195,6 +1320,15 @@ private final class HTTPConnection: @unchecked Sendable {
         return
       }
       startedAt = DispatchTime.now()
+      // The head is measured whether or not it arrived in pieces. Tested
+      // before this: an oversized head delivered in ONE write found its
+      // terminator on the first pass and skipped the check above entirely,
+      // so the reference answered 431 (measured 2026-09-22 on 3497 with a
+      // 70 KiB header in a single send) and this server served the request.
+      if buffer.distance(from: buffer.startIndex, to: separator.lowerBound) > HTTPConnection.headerLimit {
+        respondBare(431, note: "request_header_fields_too_large")
+        return
+      }
       let block = buffer.subdata(in: buffer.startIndex..<separator.lowerBound)
       buffer = Data(buffer[separator.upperBound...])
       // Bare LF: the reference's parser reads the version token to the end of
@@ -1228,8 +1362,31 @@ private final class HTTPConnection: @unchecked Sendable {
         return
       }
       head = parsed
-      expected = parsed.contentLength ?? 0
-      if expected > Protocol.maxRequestBody { overflow = true }
+      // RFC 7230 §3.3.3: when Transfer-Encoding is present it wins and
+      // Content-Length is ignored. Bun/uWS decodes chunked normally —
+      // measured 2026-09-22 on 3497, a chunked POST to /api/auth/ws-ticket
+      // answers 200, so the body really is reassembled there. This port read
+      // Content-Length ONLY, so every chunked request was dispatched with a
+      // zero-length body and every body-bearing route answered 400
+      // invalid_json while the chunk octets stayed in the read buffer.
+      let encoding = parsed.headers["transfer-encoding"]?.lowercased()
+      let lastCoding = encoding?.components(separatedBy: ",").last?.trimmingCharacters(in: .whitespaces)
+      if let lastCoding {
+        // Only `chunked` is decoded. `identity` is NOT waved through to the
+        // Content-Length path — measured 2026-09-22 on 3497, a request with
+        // `Transfer-Encoding: identity` and a valid Content-Length body is a
+        // 400 there, so uWS refuses every transfer coding it does not
+        // implement rather than ignoring the header.
+        guard lastCoding == "chunked" else {
+          respondBare(400, note: "invalid_request")
+          return
+        }
+        chunked = true
+        expected = 0
+      } else {
+        expected = parsed.contentLength ?? 0
+        if expected > Protocol.maxRequestBody { overflow = true }
+      }
     }
     guard let head else { return }
     if overflow {
@@ -1239,10 +1396,64 @@ private final class HTTPConnection: @unchecked Sendable {
       respondBare(413, note: "request_body_too_large")
       return
     }
+    if chunked {
+      switch decodeChunked(buffer) {
+      case .need:
+        return
+      case .invalid:
+        respondBare(400, note: "invalid_request")
+      case .overflow:
+        respondBare(413, note: "request_body_too_large")
+      case .done(let body, let leftover):
+        dispatch(head: head, body: body, leftover: leftover)
+      }
+      return
+    }
     guard buffer.count >= expected else { return }
     let body = Data(buffer.prefix(expected))
     let leftover = Data(buffer.dropFirst(expected))
     dispatch(head: head, body: body, leftover: leftover)
+  }
+
+  private enum ChunkOutcome {
+    case need
+    case invalid
+    case overflow
+    case done(Data, Data)
+  }
+
+  /// RFC 7230 §4.1 chunked framing: `<hex-size>[;ext]CRLF <octets> CRLF`,
+  /// terminated by a zero-size chunk and a trailer section. The accumulated
+  /// body is capped by the same `Protocol.maxRequestBody` a Content-Length
+  /// body is, so an unbounded chunk stream cannot outgrow it.
+  private func decodeChunked(_ input: Data) -> ChunkOutcome {
+    var body = Data()
+    var index = input.startIndex
+    let crlf = Data("\r\n".utf8)
+    while true {
+      guard let line = input.range(of: crlf, in: index..<input.endIndex) else { return .need }
+      let raw = input.subdata(in: index..<line.lowerBound)
+      guard let text = String(data: raw, encoding: .utf8) else { return .invalid }
+      let sizeText = (text.components(separatedBy: ";").first ?? "").trimmingCharacters(in: .whitespaces)
+      guard !sizeText.isEmpty, sizeText.count <= 16, let size = Int(sizeText, radix: 16), size >= 0
+      else { return .invalid }
+      index = line.upperBound
+      if size == 0 {
+        // Trailer section: header lines until a blank one.
+        while true {
+          guard let end = input.range(of: crlf, in: index..<input.endIndex) else { return .need }
+          let blank = end.lowerBound == index
+          index = end.upperBound
+          if blank { return .done(body, Data(input[index...])) }
+        }
+      }
+      if body.count + size > Protocol.maxRequestBody { return .overflow }
+      guard input.distance(from: index, to: input.endIndex) >= size + 2 else { return .need }
+      let end = input.index(index, offsetBy: size)
+      body.append(input.subdata(in: index..<end))
+      guard input[end] == 0x0D, input[input.index(after: end)] == 0x0A else { return .invalid }
+      index = input.index(end, offsetBy: 2)
+    }
   }
 
   private func dispatch(head: HTTPRequestHead, body: Data, leftover: Data) {
@@ -1250,9 +1461,17 @@ private final class HTTPConnection: @unchecked Sendable {
     cancelIdle()
     let began = startedAt
     let ip = clientIP()
-    let task = Task { [server] in
+    let task = Task { [server, queue] in
       let (outcome, headers) = await server.handle(head: head, body: body)
-      self.complete(outcome: outcome, headers: headers, head: head, ip: ip, began: began, leftover: leftover)
+      // Back onto the connection's own serial queue before touching any of
+      // its state. `complete()` writes `responded`, `finished` and `retain`,
+      // and `receive` / `monitorPeer` / the idle and deadline timers write
+      // the same fields from this queue — running it on the cooperative pool
+      // instead was an unsynchronized two-thread race behind the
+      // `@unchecked Sendable`.
+      queue.async {
+        self.complete(outcome: outcome, headers: headers, head: head, ip: ip, began: began, leftover: leftover)
+      }
     }
     handler = task
     let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -1260,14 +1479,13 @@ private final class HTTPConnection: @unchecked Sendable {
     timer.setEventHandler { task.cancel() }
     timer.resume()
     deadline = timer
-    // One receive stays armed from here on. Before the response it is
-    // `request.signal`: a client that hangs up mid-flight cancels the handler,
-    // killing any herdr subprocess run for a request nobody awaits. After the
-    // response it is the graceful-close wait: the server does NOT close first,
-    // so no RST reaches a client still reading the body (Bun's `fetch` reported
-    // exactly that on ~10% of requests), and the client — not the server — is
-    // the one left in TIME_WAIT. Not for an upgrade: post-101 bytes are the
-    // socket module's.
+    // One receive stays armed from here on: it is `request.signal`, so a client
+    // that hangs up mid-flight cancels the handler and kills any herdr
+    // subprocess run for a request nobody awaits. It does NOT outlive the
+    // response — the server writes the body and closes (`Connection: close`).
+    // A graceful half-close was tried instead and reverted: it made the server
+    // the active closer and exhausted TIME_WAIT (150/150 curl failures).
+    // Not armed for an upgrade: post-101 bytes are the socket module's.
     if head.path != "/ws" && head.path != "/ws/pty" { monitorPeer() }
   }
 
@@ -1300,13 +1518,26 @@ private final class HTTPConnection: @unchecked Sendable {
         // Bun reads Content-Length off its own Response, which `Response.json`
         // never sets — so the size column is "-" there, and is here too.
         bytes: nil, milliseconds: milliseconds, origin: head.headers["origin"] ?? "", note: note)
-      server.log(entry)
+      // Two responses on the reference side never reach `logged()`, so they
+      // never reach the access log — measured 2026-09-22 against 3497:
+      //   * a SUCCESSFUL preflight: `new Response(null, {status: 204, …})`,
+      //     built by hand in the OPTIONS branch. A REFUSED preflight goes
+      //     through `failure()` and IS logged, on both servers.
+      //   * `500 request_failed`: Bun's `error()` fallback, which fires when
+      //     `new URL(request.url)` throws on an unparseable Host.
+      // The Swift port logged both until this check, one extra line each.
+      let unlogged = (status == 204 && head.method == "OPTIONS") || note == "request_failed"
+      if !unlogged { server.log(entry) }
       // Stop the mid-flight disconnect watch, then send and close. Immediate
       // close is standard `Connection: close`: curl, undici and browsers all
-      // handle it cleanly. Bun's own `fetch`, which pools aggressively, can
-      // race the close and report "socket closed unexpectedly" on a small
-      // fraction of rapid requests — a client artifact of the mandated header,
-      // reproduced against any Connection: close server; see the report.
+      // handle it cleanly. An earlier note here claimed Bun's own pooling
+      // `fetch` races that close and reports "socket closed unexpectedly" on a
+      // small fraction of rapid requests. Re-measured 2026-09-22 by
+      // utils/conformance.mjs: 150 sequential plus 150 in 15-way parallel
+      // fetches from Bun 1.3.14, ZERO failures against this server and zero
+      // against the reference. The claim does not reproduce at that scale; the
+      // one real divergence is the header itself (the reference keeps the
+      // connection alive), and it is in the README parity table.
       responded = true
       write(serialize(status: status, headers: headers, body: body), thenClose: true)
     case .upgrade(let path, let readOnly):
@@ -1355,7 +1586,12 @@ private final class HTTPConnection: @unchecked Sendable {
       bag.set("Content-Type", "application/json;charset=utf-8")
       bag.set("Date", httpDate(Date()))
       bag.set("Content-Length", String(body.count))
-    } else if status != 101 && status != 204 {
+    } else if status != 101 {
+      // 204 gets Date and `Content-Length: 0` too. RFC 7230 says a 204 carries
+      // no Content-Length; Bun sends one anyway, and this is a parity port.
+      // Measured 2026-09-22 on 3497 — a successful CORS preflight ends
+      // `Date: …` / `Content-Length: 0`, and the port was the only one of the
+      // two omitting both.
       bag.set("Date", httpDate(Date()))
       bag.set("Content-Length", "0")
     }
@@ -1370,17 +1606,24 @@ private final class HTTPConnection: @unchecked Sendable {
 
   /// A status line and nothing else. Bun's body-size rejection carries no
   /// Cache-Control, no Content-Type and no payload, so neither does this one.
-  /// The access line is kept anyway: Bun logs nothing here, and a 413 that
-  /// leaves no trace is indistinguishable from a request that never arrived.
+  ///
+  /// It writes NO access line either. Every caller here is a rejection Bun
+  /// makes at the server level, before its fetch handler — and therefore
+  /// before the `logged()` wrapper — exists. Measured 2026-09-22 against the
+  /// reference on 3497: an oversized POST and an HTTP/1.1 request with no Host
+  /// both produce the status line and not one byte of log. An earlier revision
+  /// of this port logged them anyway, reasoning that a 413 leaving no trace is
+  /// indistinguishable from a request that never arrived; that is a real
+  /// observability argument and a real divergence, and parity won. Restoring
+  /// it is one `server.log(...)` call — but then `just conformance` goes red
+  /// on "access log lines", by design.
+  ///
+  /// - Parameter note: the reason, kept for the one place it is still visible
+  ///   (a future structured log) and to keep the call sites self-describing.
   private func respondBare(_ status: Int, note: String) {
+    _ = note
     dispatched = true
     cancelIdle()
-    server.log(
-      AccessEntry(
-        ip: clientIP(), method: head?.method ?? "-", path: head?.path ?? "-",
-        query: head?.queryPairs ?? [], status: status, bytes: nil,
-        milliseconds: Double(DispatchTime.now().uptimeNanoseconds - startedAt.uptimeNanoseconds) / 1_000_000,
-        origin: head?.headers["origin"] ?? "", note: note))
     let text = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\nConnection: close\r\n\r\n"
     write(Data(text.utf8), thenClose: true)
   }
